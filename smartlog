@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+name = "smartlog"
+version = "0.1"
+
+import sys, os, os.path, signal, io, time, threading, queue
+import argparse, re, shlex, subprocess, sqlite3, lzma, tarfile
+
+schema = ["""
+CREATE TABLE sessions (
+    id INTEGER PRIMARY KEY,
+    start_time DATETIME NOT NULL
+);
+
+CREATE TABLE logs (
+    session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER,
+    dev STRING,
+    time DATETIME,
+    returncode INTEGER,
+    stdout_len INTEGER,
+    stderr_len INTEGER,
+    compressed BLOB,
+    PRIMARY KEY (session_id, seq)
+);
+
+CREATE TABLE drives (
+    id INTEGER PRIMARY KEY,
+    family STRING NOT NULL,
+    model STRING NOT NULL,
+    serial STRING NOT NULL,
+    firmware STRING NOT NULL,
+    capacity INTEGER NOT NULL,
+    UNIQUE (family, model, serial, firmware, capacity)
+);
+
+CREATE TABLE attrs (
+    drive_id INTEGER REFERENCES drives(id) ON DELETE CASCADE,
+    time DATETIME NOT NULL,
+    start_stop INTEGER,
+    reallocated INTEGER,
+    power_on REAL,
+    power_cycle INTEGER,
+    poweroff_retract INTEGER,
+    load_cycle INTEGER,
+    temperature REAL,
+    head_flying REAL,
+    total_written INTEGER,
+    total_read INTEGER
+);
+"""]
+
+default_db_file = "/var/db/{}.sqlite".format(name)
+def db_connect(db_file=default_db_file):
+    conn = sqlite3.connect(db_file, timeout=3600,
+                           isolation_level=None, check_same_thread=False)
+    c = conn.cursor()
+    if c.execute("PRAGMA journal_mode = WAL").fetchone()[0] != "wal":
+        raise Exception("need WAL mode due to long-running reader in -x")
+    c.execute("PRAGMA foreign_keys = ON")
+    with conn:
+        c.execute("BEGIN") # with conn only does COMMIT/ROLLBACK
+        c.execute("CREATE TABLE IF NOT EXISTS _schema (updated DATETIME);")
+        for i, script in enumerate(schema):
+            if c.execute("SELECT COUNT(*) FROM _schema").fetchone()[0] == i:
+                # executescript() inserts a COMMIT
+                for line in script.split(";"):
+                    c.execute(line)
+                c.execute("INSERT INTO _schema VALUES (?)", (time.time(),))
+    c.close()
+    return conn
+
+class Log:
+    @classmethod
+    def query(cls, dev, smartctl):
+        self = cls()
+        self.dev = dev
+        self.time = time.time()
+        p = subprocess.Popen([smartctl, "-x", dev],
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             bufsize=-1)
+        self.stdout, self.stderr = p.communicate()
+        self.returncode = p.returncode
+        return self
+
+    def parse(self):
+        meta = ["", "", "", "", -1]
+        attrs = {}
+        id_end = None
+        for line in self.stdout.decode("ascii", "replace").splitlines():
+            match = re.match(r"((ID# *) .* )RAW_VALUE$", line)
+            if match:
+                raw_start, id_end = map(len, match.groups())
+                continue
+            if id_end:
+                try:
+                    attrs[int(line[:id_end], 0)] = line[raw_start:]
+                except ValueError:
+                    id_end = None
+                continue
+            match = re.match(r"User Capacity: *(\d[^ ]*) bytes", line)
+            if match:
+                # group delimiter is locale-dependent
+                meta[4] = int("".join(re.findall(r"\d+", match.group(1))))
+                continue
+            match = re.match(
+                r"(?:(Model Family)|(Device Model)|(Serial Number)|"
+                    "(Firmware Version)): *(.*)$", line)
+            if match:
+                for i in range(4):
+                    if match.group(1+i):
+                        meta[i] = match.group(5)
+        def count(id):
+            try:
+                return int(attrs[id])
+            except (KeyError, ValueError):
+                pass
+        def hours(id):
+            if id in attrs:
+                match = re.match(r"(\d+)(?:h(?:\+(\d+)m)?"
+                                 "(?:\+(\d+\.?\d*)s)?)?$", attrs[id])
+                if match:
+                    h, m, s = match.groups("0")
+                    return int(h) + int(m)/60. + float(s)/3600.
+        def temp(id):
+            if id in attrs:
+                match = re.match(r"(\d+)(?: \(.*\)?)?$", attrs[id])
+                if match:
+                    return int(match.group(1))
+        return meta, (count(4), count(5), hours(9), count(12), count(192),
+                      count(193), temp(194), hours(240), count(241), count(242))
+
+    @classmethod
+    def extract_header(cls, dev, time, returncode, stdout_len, stderr_len):
+        self = cls()
+        self.dev = dev
+        self.time = time
+        self.returncode = returncode
+        self.stdout_len = stdout_len
+        self.stderr_len = stderr_len
+        return self
+
+    def tar_add(self, tar, prefix=""):
+        info = tarfile.TarInfo()
+        info.type = tarfile.REGTYPE
+        dev = self.dev
+        if dev.startswith("/dev/"):
+            dev = dev[5:]
+        info.name = "{}{}_{}.log".format(
+            prefix,
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.time)),
+            dev.replace("/", "-"))
+        info.size = len(self.stdout)
+        info.mtime = self.time
+        info.uname = "root"
+        info.gname = "wheel"
+        tar.addfile(info, io.BytesIO(self.stdout))
+
+def daemonize():
+    if os.fork():
+        os._exit(0)
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+
+class Logger:
+    default_smartctl = "smartctl"
+    default_interval = 60
+    def __init__(self, db_file,
+                 smartctl=default_smartctl, interval=default_interval):
+        self._conn = db_connect(db_file)
+        self.smartctl = smartctl
+        self.interval = interval
+        self.start_time = time.time()
+        c = self._conn.cursor()
+        c.execute("INSERT INTO sessions VALUES (NULL, ?)", (self.start_time,))
+        self.session_id = c.lastrowid
+        c.close()
+
+    def _inserter_thread(self):
+        compressor = lzma.LZMACompressor(preset=9|lzma.PRESET_EXTREME)
+        seq = 0
+        while True:
+            log = self._queue.get()
+            if log:
+                row = (self.session_id, seq, log.dev, log.time, log.returncode,
+                       len(log.stdout), len(log.stderr),
+                       compressor.compress(log.stdout + log.stderr))
+                meta, attrs = log.parse()
+            else:
+                row = (self.session_id, seq, None, None, None, None, None,
+                       compressor.flush())
+            with self._conn:
+                c = self._conn.cursor()
+                c.execute("BEGIN")
+                c.execute("INSERT INTO logs VALUES "
+                          "(?, ?, ?, ?, ?, ?, ?, ?)", row)
+                if log and any(meta[:4]):
+                    c.execute("INSERT OR IGNORE INTO drives VALUES "
+                              "(NULL, ?, ?, ?, ?, ?)", meta)
+                    id = c.execute("SELECT id FROM drives WHERE "
+                                   "family=? AND model=? AND serial=? AND "
+                                   "firmware=? AND CAPACITY=?",
+                                   meta).fetchone()[0]
+                    c.execute("INSERT INTO attrs VALUES "
+                              "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              (id, log.time) + attrs)
+            seq += 1
+            self._queue.task_done()
+            if not log:
+                break
+
+    def step(self):
+        p = subprocess.Popen([self.smartctl, "--scan"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             bufsize=-1)
+        stdout, _ = p.communicate()
+        if p.returncode == 0:
+            for line in stdout.decode("ascii", "replace").splitlines():
+                args = shlex.split(line, comments=True)
+                dev = args[0] # rest is -d scsi which isn't quite correct
+                log = Log.query(dev, self.smartctl)
+                self._queue.put(log)
+
+    def _sigterm(self, signum, frame):
+        sys.exit(0)
+
+    def run(self):
+        self._queue = queue.Queue()
+        inserter = threading.Thread(target=self._inserter_thread)
+        inserter.start()
+
+        signal.signal(signal.SIGTERM, self._sigterm)
+
+        last = time.monotonic()
+        try:
+            while True:
+                self.step()
+                target = last + self.interval
+                # sleep in increments or signal can't interrupt
+                while True:
+                    remain = target - time.monotonic()
+                    if remain <= 0:
+                        break
+                    time.sleep(min(1, remain))
+                last = target
+        finally:
+            self._queue.put(None)
+            inserter.join()
+
+def extract(db_file):
+    tar = tarfile.open(fileobj=sys.stdout.buffer, mode="w|",
+                       format=tarfile.PAX_FORMAT)
+    conn = db_connect(db_file)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM logs JOIN sessions ON session_id = sessions.id "
+              "ORDER BY session_id, seq")
+    session_id = None
+    for row in c:
+        if session_id != row["session_id"]:
+            session_id = row["session_id"]
+            seq = 0
+            decompressor = lzma.LZMADecompressor()
+            queue = []
+            data = b""
+            start_time = row["start_time"]
+            info = tarfile.TarInfo()
+            info.type = tarfile.DIRTYPE
+            info.name = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                      time.gmtime(start_time))
+            info.mtime = start_time
+            info.uname = "root"
+            info.gname = "wheel"
+            tar.addfile(info)
+        if seq != row["seq"]:
+            raise Exception("missing data for session_id={}".format(session_id))
+        seq += 1
+        if row["dev"] is not None:
+            queue.append(Log.extract_header(
+                row["dev"], row["time"], row["returncode"],
+                row["stdout_len"], row["stderr_len"]))
+        if row["compressed"]:
+            data += decompressor.decompress(row["compressed"])
+        while queue:
+            total = queue[0].stdout_len + queue[0].stderr_len
+            if total > len(data):
+                break
+            log = queue.pop(0)
+            log.stdout = data[:log.stdout_len]
+            log.stderr = data[log.stdout_len:total]
+            data = data[total:]
+            log.tar_add(tar, prefix=info.name+"/")
+    tar.close()
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=name,
+        description="Run smartctl -x every minute and save output.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        argument_default=argparse.SUPPRESS, add_help=False)
+
+    parser.add_argument("-h", "--help", action="help", help=argparse.SUPPRESS)
+    parser.add_argument("--version", action="version",
+                        version="%(prog)s "+version, help=argparse.SUPPRESS)
+    parser.add_argument("-f", metavar="db", type=str,
+                        default=default_db_file,
+                        help="database file")
+    parser.add_argument("-c", metavar="smartctl", type=str,
+                        default=Logger.default_smartctl,
+                        help="smartctl binary")
+    parser.add_argument("-i", metavar="interval", type=int,
+                        default=Logger.default_interval,
+                        help="interval between smartctl runs")
+    parser.add_argument("-d", action="store_true", help="don't daemonize")
+    parser.add_argument("-x", action="store_true",
+                        help="extract raw logs to stdout in tar format")
+    args = parser.parse_args()
+
+    if "x" in args:
+        extract(args.f)
+    else:
+        logger = Logger(args.f, smartctl=args.c, interval=args.i)
+        if "d" not in args:
+            daemonize()
+        logger.run()
+
+if __name__ == "__main__":
+    main()
