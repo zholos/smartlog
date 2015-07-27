@@ -218,6 +218,8 @@ class Logger:
         if p.returncode == 0:
             for line in stdout.decode("ascii", "replace").splitlines():
                 args = shlex.split(line, comments=True)
+                if not args:
+                    continue # e.g. Permission denied
                 dev = args[0] # rest is -d scsi which isn't quite correct
                 log = Log.query(dev, self.smartctl)
                 self._queue.put(log)
