@@ -8,6 +8,9 @@ Simply run ``smartlog`` at system startup to start collecting data. By default
 the data is saved to ``/var/db/smartlog.sqlite`` in one-minute intervals. This
 can be configured with command-line options.
 
+In order to function this program needs to be able to run ``smartctl --scan``
+and ``smartctl -x $dev``, which typically requires root access.
+
 The raw outputs can be extracted as a tar stream. Note that they are batched up
 for compression so recent outputs can't be accessed immediately.
 
